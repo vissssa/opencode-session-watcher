@@ -21,3 +21,5 @@ vendor/
 .idea/
 .vscode/
 data/
+
+CLAUDE.md
