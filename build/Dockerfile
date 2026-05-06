@@ -11,7 +11,7 @@ WORKDIR $WORK_DIR/session_watcher
 RUN [ -d "build" ] && { cp -r "build"/* . && rm -rf "build";} || echo "build目录不存在。"
 RUN ln -snf /usr/share/zoneinfo/$TIME_ZONE /etc/localtime && echo $TIME_ZONE > /etc/timezone
 RUN chown -R bml:bml $WORK_DIR && \
-    chmod +x $WORK_DIR/session_watcher/bin/session_watcher && \
+    chmod +x $WORK_DIR/session_watcher/session_watcher && \
     rm -rf arm64_build
 
 USER bml
