@@ -19,7 +19,7 @@ prepare:
 #make compile
 compile: build
 build:
-	go build -o $(HOMEDIR)/session_watcher
+	go build -o $(HOMEDIR)/session_watcher ./cmd/session-watcher
 
 # make test, test your code
 test: prepare
