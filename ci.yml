@@ -1,0 +1,56 @@
+# 百度 Go 编译环境使用指南 https://ku.baidu-int.com/d/SzGt0sD37hWmmp
+
+Global:
+    version: 2.0
+    group_email: zhangyu94@baidu.com   # <------ 配置团队邮箱地址，用于接收xx.latest软件版本升级通知邮件
+
+
+Default:
+    profile : [build, arm64_build]
+
+Profiles:
+    - profile:
+      name : build
+      mode: AGENT
+      environment:
+        image: DECK_STD_CENTOS7
+        tools:
+          - go: 1.25.latest
+          - gcc: 12
+      build:
+        command: make -f Makefile
+        cache:                    # http://buildcloud.baidu.com/bcloud/9-bcloud_subcmd#9.15-cache
+          enable: true            # 删除模块全部缓存：bcloud cache --delete --repo=baidu/gdp/ghttp
+          trimeThresholdSize: 3
+#          paths:                 # paths 为空时，会使用编译系统默认的缓存目录
+#            - cache
+      check:
+        - reuse: TASK
+          enable: true
+      artifacts:
+        release: true
+        platform:
+          arch: X86_64   # (必填) 产出对应架构，可选值为X86_64、AARCH64、SW_64
+          os: LINUX      # (必填) 产出对应操作系统，可选值为LINUX、WINDOWS、DARWIN
+
+
+    - profile:
+      name : arm64_build
+      mode: AGENT
+      environment:
+        image: DECK_STD_CENTOS7
+        tools:
+          - go: 1.25.latest
+          - gcc: 12
+      build:
+        command: export GOOS=linux; export GOARCH=arm64; make -f Makefile
+        cache:
+          enable: true
+          trimeThresholdSize: 3
+#          paths:                 # paths 为空时，会使用编译系统默认的缓存目录
+#            - cache
+      artifacts:
+        release: true
+        platform:
+          arch: AARCH64   # (必填) 产出对应架构，可选值为X86_64、AARCH64、SW_64
+          os: LINUX       # (必填) 产出对应操作系统，可选值为LINUX、WINDOWS、DARWIN

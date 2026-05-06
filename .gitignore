@@ -1,0 +1,23 @@
+# 编译产出
+output/
+*.exe
+
+# 运行时数据
+*.db
+*.db-wal
+*.db-shm
+*.jsonl
+
+# 日志
+*.log
+
+# Go 工具链
+vendor/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+data/
