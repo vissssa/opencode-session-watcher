@@ -270,8 +270,18 @@ func TestStoreSchemaSanityRejectsOldSchema(t *testing.T) {
 	}
 }
 
+// validTables 是允许在 PRAGMA table_info 中查询的表名白名单，防止 SQL 注入。
+var validTables = map[string]bool{
+	"sessions": true,
+	"messages": true,
+}
+
 func assertColumnExists(t *testing.T, ctx context.Context, db *sql.DB, table, column string, want bool) {
 	t.Helper()
+	if !validTables[table] {
+		t.Fatalf("assertColumnExists: invalid table name %q", table)
+	}
+	// PRAGMA table_info 不支持参数化绑定，通过白名单校验 table 防止 SQL 注入。
 	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
 	if err != nil {
 		t.Fatal(err)
