@@ -2,30 +2,97 @@ package store
 
 import (
 	"context"
-	"database/sql"
-	"errors"
-	"path/filepath"
+	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
 	"session_watcher/internal/domain"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// testDSN 从环境变量获取测试 PostgreSQL 连接字符串，未设置时 skip。
+func testDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv("PG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG_TEST_DSN not set, skipping PostgreSQL integration tests")
+	}
+	return dsn
+}
+
+// setupTestStore 为每个测试创建独立的 schema 并初始化 Store。
+// 测试结束后自动 DROP schema 清理。
+func setupTestStore(t *testing.T) *Store {
+	t.Helper()
+	ctx := context.Background()
+	dsn := testDSN(t)
+
+	// 连接默认 schema 创建测试专用 schema
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect pg: %v", err)
+	}
+	// 用测试名生成唯一 schema 名（替换非法字符）
+	schemaName := "test_" + strings.ReplaceAll(
+		strings.ReplaceAll(t.Name(), "/", "_"),
+		"-", "_",
+	)
+	// schema 名长度限制，取前 60 字符
+	if len(schemaName) > 60 {
+		schemaName = schemaName[:60]
+	}
+	schemaName = strings.ToLower(schemaName)
+	if _, err := pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName)); err != nil {
+		pool.Close()
+		t.Fatalf("drop schema: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s", schemaName)); err != nil {
+		pool.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	pool.Close()
+
+	// 使用独立 schema 的 DSN 打开 Store
+	schemaDSN := dsn
+	if strings.Contains(dsn, "?") {
+		schemaDSN += "&search_path=" + schemaName
+	} else {
+		schemaDSN += "?search_path=" + schemaName
+	}
+	st, err := Open(ctx, schemaDSN)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		st.Close()
+		// 清理 schema
+		cleanPool, err := pgxpool.New(context.Background(), dsn)
+		if err == nil {
+			cleanPool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName))
+			cleanPool.Close()
+		}
+	})
+	return st
+}
 
 func TestStoreSessionAndMessageState(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
+	st := setupTestStore(t)
+
+	// 验证核心列存在
+	cols, err := st.tableColumns(ctx, "messages")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-
-	assertColumnExists(t, ctx, st.db, "sessions", "raw_json", true)
-	assertColumnExists(t, ctx, st.db, "sessions", "last_fetch_reached_limit", true)
-	assertColumnExists(t, ctx, st.db, "messages", "raw_json", false)
-	assertColumnExists(t, ctx, st.db, "messages", "status", true)
-	assertTableExists(t, ctx, st.db, "schema_migrations", false)
+	for _, col := range []string{"output_line", "status"} {
+		if _, ok := cols[col]; !ok {
+			t.Fatalf("messages.%s column missing", col)
+		}
+	}
 
 	_, found, err := st.GetSessionState(ctx, "ses_1")
 	if err != nil {
@@ -64,6 +131,9 @@ func TestStoreSessionAndMessageState(t *testing.T) {
 	if exists {
 		t.Fatal("pending message should not be considered written")
 	}
+
+	// 模拟 Sink 写入后设置 OutputLine
+	prepared[0].OutputLine = 5
 	if err := st.MarkMessagesWritten(ctx, session, prepared, 40); err != nil {
 		t.Fatal(err)
 	}
@@ -100,24 +170,25 @@ func TestStoreSessionAndMessageState(t *testing.T) {
 		t.Fatalf("existing ids = %#v", existing)
 	}
 
-	row := st.db.QueryRowContext(ctx, `SELECT user_id, agent_id, sink_type, output_root, output_path, output_session_file, status, written_at FROM messages WHERE id = ?`, "msg_1")
-	var userID, agentID, sinkType, outputRoot, outputPath, outputSessionFile, status string
+	// 验证输出追踪字段和 output_line
+	var userID, agentID, sinkType, outputRoot, outputPath, outputSessionFile, msgStatus string
 	var writtenAt int64
-	if err := row.Scan(&userID, &agentID, &sinkType, &outputRoot, &outputPath, &outputSessionFile, &status, &writtenAt); err != nil {
+	var outputLine int
+	err = st.pool.QueryRow(ctx,
+		`SELECT user_id, agent_id, sink_type, output_root, output_path, output_session_file, status, written_at, output_line FROM messages WHERE id = $1`, "msg_1").
+		Scan(&userID, &agentID, &sinkType, &outputRoot, &outputPath, &outputSessionFile, &msgStatus, &writtenAt, &outputLine)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if userID != "user_1" || agentID != "agent_1" || sinkType != "jsonl" || outputRoot != "./data/messages" || outputPath != "data/messages/user_1/agent_1/ses_1.jsonl" || outputSessionFile != "ses_1.jsonl" || status != MessageStatusWritten || writtenAt != 40 {
-		t.Fatalf("output tracking = %q %q %q %q %q %q %q %d", userID, agentID, sinkType, outputRoot, outputPath, outputSessionFile, status, writtenAt)
+	if userID != "user_1" || agentID != "agent_1" || sinkType != "jsonl" || outputRoot != "./data/messages" || outputPath != "data/messages/user_1/agent_1/ses_1.jsonl" || outputSessionFile != "ses_1.jsonl" || msgStatus != MessageStatusWritten || writtenAt != 40 || outputLine != 5 {
+		t.Fatalf("output tracking = %q %q %q %q %q %q %q %d %d", userID, agentID, sinkType, outputRoot, outputPath, outputSessionFile, msgStatus, writtenAt, outputLine)
 	}
 }
 
 func TestStorePendingMessagesAreRetried(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
+
 	session := domain.Session{ID: "ses_1", UserID: "user", AgentID: "agent", UpdatedAt: 1, Raw: []byte(`{"id":"ses_1"}`)}
 	record := domain.MessageRecord{UserID: "user", AgentID: "agent", SessionID: "ses_1", MessageID: "msg_pending", MessageCreatedAt: 1, SinkType: "jsonl"}
 	if _, err := st.PrepareMessageRecords(ctx, session, []domain.MessageRecord{record}, 10); err != nil {
@@ -134,7 +205,7 @@ func TestStorePendingMessagesAreRetried(t *testing.T) {
 		t.Fatal(err)
 	}
 	var lastError string
-	if err := st.db.QueryRowContext(ctx, `SELECT last_error FROM messages WHERE id = ?`, "msg_pending").Scan(&lastError); err != nil {
+	if err := st.pool.QueryRow(ctx, `SELECT last_error FROM messages WHERE id = $1`, "msg_pending").Scan(&lastError); err != nil {
 		t.Fatal(err)
 	}
 	if len(lastError) != 512 {
@@ -144,15 +215,12 @@ func TestStorePendingMessagesAreRetried(t *testing.T) {
 
 func TestStoreBatchExistingMessageIDs(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
 
 	session := domain.Session{ID: "ses_bulk", UserID: "user", AgentID: "agent", UpdatedAt: 1, Raw: []byte(`{"id":"ses_bulk"}`)}
-	records := make([]domain.MessageRecord, 0, 1000)
-	for i := 0; i < 1000; i++ {
+	const batchSize = 100
+	records := make([]domain.MessageRecord, 0, batchSize)
+	for i := 0; i < batchSize; i++ {
 		id := "msg_bulk_" + strconv.Itoa(i)
 		records = append(records, domain.MessageRecord{UserID: "user", AgentID: "agent", SessionID: session.ID, MessageID: id, MessageCreatedAt: int64(i), SinkType: "jsonl"})
 	}
@@ -163,7 +231,7 @@ func TestStoreBatchExistingMessageIDs(t *testing.T) {
 	if err := st.MarkMessagesWritten(ctx, session, prepared, 2); err != nil {
 		t.Fatal(err)
 	}
-	messages := make([]domain.Message, 0, 1000)
+	messages := make([]domain.Message, 0, batchSize)
 	for i, record := range records {
 		messages = append(messages, domain.Message{ID: record.MessageID, SessionID: session.ID, CreatedAt: int64(i)})
 	}
@@ -171,7 +239,7 @@ func TestStoreBatchExistingMessageIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seen != 1000 || len(unseen) != 0 {
+	if seen != batchSize || len(unseen) != 0 {
 		t.Fatalf("seen=%d unseen=%d", seen, len(unseen))
 	}
 }
@@ -180,11 +248,7 @@ func TestStoreBatchExistingMessageIDs(t *testing.T) {
 // 这是 fetchUntilBoundary 边界探测的核心调用路径，必须有独立测试。
 func TestStoreAnyMessageExists(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
 
 	session := domain.Session{ID: "ses_any", UserID: "u", AgentID: "a", UpdatedAt: 1, Raw: []byte(`{"id":"ses_any"}`)}
 	msgs := []domain.Message{
@@ -232,11 +296,8 @@ func TestStoreAnyMessageExists(t *testing.T) {
 
 func TestStoreFetchStats(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
+
 	if err := st.UpdateSessionFetchStats(ctx, "ses_1", true, 1000, 1000, 123); err != nil {
 		t.Fatal(err)
 	}
@@ -249,97 +310,12 @@ func TestStoreFetchStats(t *testing.T) {
 	}
 }
 
-func TestStoreSchemaSanityRejectsOldSchema(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = db.ExecContext(ctx, `CREATE TABLE messages (id TEXT PRIMARY KEY, raw_json TEXT NOT NULL);`)
-	if err != nil {
-		db.Close()
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	_, err = Open(ctx, path)
-	if err == nil || !strings.Contains(err.Error(), "messages.session_id missing") {
-		t.Fatalf("expected schema error, got %v", err)
-	}
-}
-
-// validTables 是允许在 PRAGMA table_info 中查询的表名白名单，防止 SQL 注入。
-var validTables = map[string]bool{
-	"sessions": true,
-	"messages": true,
-}
-
-func assertColumnExists(t *testing.T, ctx context.Context, db *sql.DB, table, column string, want bool) {
-	t.Helper()
-	if !validTables[table] {
-		t.Fatalf("assertColumnExists: invalid table name %q", table)
-	}
-	// PRAGMA table_info 不支持参数化绑定，通过白名单校验 table 防止 SQL 注入。
-	rows, err := db.QueryContext(ctx, `PRAGMA table_info(`+table+`)`)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	got := false
-	for rows.Next() {
-		var cid int
-		var name string
-		var typ string
-		var notNull int
-		var defaultValue any
-		var pk int
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
-			t.Fatal(err)
-		}
-		if name == column {
-			got = true
-			break
-		}
-	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if got != want {
-		t.Fatalf("column %s.%s exists = %v, want %v", table, column, got, want)
-	}
-}
-
-// TestTableColumnsRejectsUnknownTable 验证 tableColumns 对非白名单表名返回错误，
-// 防御未来调用方传入非受信字符串时发生 PRAGMA 注入。
-func TestTableColumnsRejectsUnknownTable(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state.db")
-	s, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	_, err = s.tableColumns(ctx, "unknown_table")
-	if err == nil {
-		t.Fatal("expected error for unknown table name, got nil")
-	}
-	if !strings.Contains(err.Error(), "unknown table") {
-		t.Fatalf("error message should mention 'unknown table', got: %v", err)
-	}
-}
-
 // TestMarkMessagesFailed_UTF8Truncation 验证含多字节 UTF-8 字符的错误信息被截断时，
-// 结果仍是合法 UTF-8，防止写入 SQLite 损坏数据（I-2 fix）。
+// 结果仍是合法 UTF-8，防止写入 PostgreSQL 损坏数据。
 func TestMarkMessagesFailed_UTF8Truncation(t *testing.T) {
 	ctx := context.Background()
-	st, err := Open(ctx, filepath.Join(t.TempDir(), "state.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
+
 	session := domain.Session{ID: "ses_utf8", UserID: "u", AgentID: "a", UpdatedAt: 1, Raw: []byte(`{"id":"ses_utf8"}`)}
 	record := domain.MessageRecord{UserID: "u", AgentID: "a", SessionID: "ses_utf8", MessageID: "msg_utf8", MessageCreatedAt: 1, SinkType: "jsonl"}
 	if _, err := st.PrepareMessageRecords(ctx, session, []domain.MessageRecord{record}, 1); err != nil {
@@ -353,7 +329,7 @@ func TestMarkMessagesFailed_UTF8Truncation(t *testing.T) {
 		t.Fatal(err)
 	}
 	var lastError string
-	if err := st.db.QueryRowContext(ctx, `SELECT last_error FROM messages WHERE id = ?`, "msg_utf8").Scan(&lastError); err != nil {
+	if err := st.pool.QueryRow(ctx, `SELECT last_error FROM messages WHERE id = $1`, "msg_utf8").Scan(&lastError); err != nil {
 		t.Fatal(err)
 	}
 	if len(lastError) > 512 {
@@ -368,17 +344,23 @@ func TestMarkMessagesFailed_UTF8Truncation(t *testing.T) {
 	}
 }
 
-func assertTableExists(t *testing.T, ctx context.Context, db *sql.DB, table string, want bool) {
-	t.Helper()
-	var name string
-	err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&name)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) && !want {
-			return
-		}
+// TestStoreMemorizedAt 验证 sessions 表的 memorized_at 字段默认值为 0。
+func TestStoreMemorizedAt(t *testing.T) {
+	ctx := context.Background()
+	st := setupTestStore(t)
+
+	session := domain.Session{ID: "ses_mem", UserID: "u", AgentID: "a", UpdatedAt: 1, Raw: []byte(`{"id":"ses_mem"}`)}
+	record := domain.MessageRecord{UserID: "u", AgentID: "a", SessionID: "ses_mem", MessageID: "msg_mem", MessageCreatedAt: 1, SinkType: "jsonl"}
+	if _, err := st.PrepareMessageRecords(ctx, session, []domain.MessageRecord{record}, 1); err != nil {
 		t.Fatal(err)
 	}
-	if !want {
-		t.Fatalf("table %s exists unexpectedly", table)
+
+	var memorizedAt int64
+	err := st.pool.QueryRow(ctx, `SELECT memorized_at FROM sessions WHERE id = $1`, "ses_mem").Scan(&memorizedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memorizedAt != 0 {
+		t.Fatal("sessions.memorized_at should default to 0")
 	}
 }

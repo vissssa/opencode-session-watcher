@@ -4,15 +4,78 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"session_watcher/internal/domain"
 	"session_watcher/internal/store"
 )
+
+// testDSN 从环境变量获取测试 PostgreSQL 连接字符串，未设置时 skip。
+func testDSN(t *testing.T) string {
+	t.Helper()
+	dsn := os.Getenv("PG_TEST_DSN")
+	if dsn == "" {
+		t.Skip("PG_TEST_DSN not set, skipping watcher integration tests")
+	}
+	return dsn
+}
+
+// setupTestStore 为 watcher 测试创建独立的 PG schema 并初始化 store。
+func setupTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	ctx := context.Background()
+	dsn := testDSN(t)
+
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect pg: %v", err)
+	}
+	schemaName := "test_watcher_" + strings.ReplaceAll(
+		strings.ReplaceAll(t.Name(), "/", "_"),
+		"-", "_",
+	)
+	if len(schemaName) > 60 {
+		schemaName = schemaName[:60]
+	}
+	schemaName = strings.ToLower(schemaName)
+	if _, err := pool.Exec(ctx, fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName)); err != nil {
+		pool.Close()
+		t.Fatalf("drop schema: %v", err)
+	}
+	if _, err := pool.Exec(ctx, fmt.Sprintf("CREATE SCHEMA %s", schemaName)); err != nil {
+		pool.Close()
+		t.Fatalf("create schema: %v", err)
+	}
+	pool.Close()
+
+	schemaDSN := dsn
+	if strings.Contains(dsn, "?") {
+		schemaDSN += "&search_path=" + schemaName
+	} else {
+		schemaDSN += "?search_path=" + schemaName
+	}
+	st, err := store.Open(ctx, schemaDSN)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() {
+		st.Close()
+		cleanPool, err := pgxpool.New(context.Background(), dsn)
+		if err == nil {
+			cleanPool.Exec(context.Background(), fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", schemaName))
+			cleanPool.Close()
+		}
+	})
+	return st
+}
 
 type fakeSource struct {
 	mu       sync.Mutex
@@ -69,11 +132,7 @@ func (s *memorySink) OutputRoot() string { return "memory-root" }
 
 func TestWatcherDedupAndLimitGrowth(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir()+"/state.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
 
 	seenSession := session("ses_1", 1)
 	seenMessage := message("ses_1", "msg_seen", 1)
@@ -127,11 +186,7 @@ func TestWatcherDedupAndLimitGrowth(t *testing.T) {
 
 func TestWatcherStopsAtMaxMessageFetch(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir()+"/state.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
 
 	msgs := []domain.Message{
 		message("ses_1", "msg_5", 5),
@@ -161,11 +216,7 @@ func TestWatcherStopsAtMaxMessageFetch(t *testing.T) {
 
 func TestWatcherSessionFailureDoesNotBlockOthers(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(ctx, t.TempDir()+"/state.db")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
+	st := setupTestStore(t)
 
 	source := &fakeSource{
 		sessions: []domain.Session{session("bad", 1), session("good", 1)},
@@ -212,7 +263,7 @@ func recordFromMessage(session domain.Session, message domain.Message) domain.Me
 	}
 }
 
-// TestMergeSessionMetadata 覆盖 mergeSessionMetadata 的各个 fallback 分支（当前覆盖率 45.5%）。
+// TestMergeSessionMetadata 覆盖 mergeSessionMetadata 的各个 fallback 分支。
 func TestMergeSessionMetadata(t *testing.T) {
 	cases := []struct {
 		name        string

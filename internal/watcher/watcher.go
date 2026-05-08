@@ -13,7 +13,7 @@ import (
 	"session_watcher/internal/store"
 )
 
-// Store 是 watcher 对 SQLite 状态存储的接口抽象，便于测试时替换为 fake 实现。
+// Store 是 watcher 对 PostgreSQL 状态存储的接口抽象，便于测试时替换为 fake 实现。
 type Store interface {
 	GetSessionState(ctx context.Context, sessionID string) (store.SessionState, bool, error)
 	AnyMessageExists(ctx context.Context, messages []domain.Message) (bool, error)
@@ -267,17 +267,17 @@ func (w *Watcher) syncSession(ctx context.Context, round int64, job sessionJob) 
 			Message:          msg.Raw,
 		})
 	}
-	// 填充输出追踪字段（SinkType/OutputRoot/OutputPath），供 SQLite 记录
+	// 填充输出追踪字段（SinkType/OutputRoot/OutputPath），供 PostgreSQL 记录
 	w.fillOutputTracking(records)
 
-	// PrepareMessageRecords：在 SQLite 中登记 pending 状态（双重防重）
+	// PrepareMessageRecords：在 PostgreSQL 中登记 pending 状态（双重防重）
 	prepared, err := w.store.PrepareMessageRecords(ctx, session, records, syncedAt)
 	if err != nil {
 		return 0, reachedMax, err
 	}
 	// WriteMessages：写出到 Sink（at-least-once 语义）
 	if err := w.sink.WriteMessages(ctx, prepared); err != nil {
-		// 写出失败：记录错误到 SQLite，下轮可重试
+		// 写出失败：记录错误到 PostgreSQL，下轮可重试
 		if markErr := w.store.MarkMessagesFailed(ctx, prepared, err.Error()); markErr != nil {
 			w.logger.Warn("mark messages failed error", "session_id", session.ID, "error", markErr)
 		}
@@ -374,5 +374,3 @@ func sortMessages(messages []domain.Message) {
 		return messages[i].CreatedAt < messages[j].CreatedAt
 	})
 }
-
-

@@ -31,8 +31,8 @@ type Message struct {
 }
 
 // MessageRecord 是写入 Sink 的完整记录，包含元数据字段和原始 JSON。
-// SinkType / OutputRoot / OutputPath / OutputSessionFile 为输出追踪字段，
-// 不序列化到 JSON（json:"-"），由 PathResolver 填充后写入 SQLite。
+// SinkType / OutputRoot / OutputPath / OutputSessionFile / OutputLine / OutputOffset 为输出追踪字段，
+// 不序列化到 JSON（json:"-"），由 PathResolver 和 Sink 填充后写入 PostgreSQL。
 type MessageRecord struct {
 	SyncedAt         int64           `json:"synced_at"`
 	UserID           string          `json:"user_id"`
@@ -43,11 +43,13 @@ type MessageRecord struct {
 	Session          json.RawMessage `json:"session"`
 	Message          json.RawMessage `json:"message"`
 
-	// 以下字段不写入 JSONL，仅用于 SQLite 输出追踪
+	// 以下字段不写入 JSONL，仅用于 PostgreSQL 输出追踪
 	SinkType          string `json:"-"`
 	OutputRoot        string `json:"-"`
 	OutputPath        string `json:"-"`
 	OutputSessionFile string `json:"-"`
+	OutputLine        int    `json:"-"` // 消息在 JSONL 文件中的行号（从 1 开始），由 Sink 写入时填充
+	OutputOffset      int64  `json:"-"` // 该消息写入后的文件字节大小（用于更新 sessions.file_size），由 Sink 写入时填充
 }
 
 // Source 是数据输入抽象，当前由 opencode.HTTPSource 实现。

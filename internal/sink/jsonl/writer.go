@@ -38,10 +38,14 @@ type FileSink struct {
 
 // pathLock 是单个文件路径的带引用计数的互斥锁。
 // users 记录当前持有或等待该锁的 goroutine 数量，用于安全回收。
+// lineCount 缓存该文件当前的行数，避免每次写入都全量扫描文件。
+// byteOffset 缓存该文件当前的字节大小，用于记录每条消息写入后的文件大小（更新到 sessions.file_size）。
 type pathLock struct {
-	mu       sync.Mutex
-	users    int       // 当前使用该锁的 goroutine 数量
-	lastUsed time.Time // 最近一次使用时间，用于 TTL 判断
+	mu         sync.Mutex
+	users      int       // 当前使用该锁的 goroutine 数量
+	lastUsed   time.Time // 最近一次使用时间，用于 TTL 判断
+	lineCount  int       // 该文件当前行数缓存，-1 表示未初始化
+	byteOffset int64     // 该文件当前字节大小缓存，-1 表示未初始化
 }
 
 // NewFileSink 创建 FileSink，rootDir 不存在时会自动创建。
@@ -61,6 +65,7 @@ func NewFileSink(rootDir string, logger *slog.Logger) (*FileSink, error) {
 
 // WriteMessages 将 records 批量追加写入对应的 JSONL 文件。
 // 相同输出路径的记录会被分组后串行写入，不同路径可并发写入（各自持有独立锁）。
+// 写入时自动填充每条 record 的 OutputLine（行号从 1 开始）和 OutputOffset（写入后文件字节大小）字段。
 // 每次写完后尝试定期清理空闲的文件锁，防止 locks map 无界增长。
 func (s *FileSink) WriteMessages(ctx context.Context, records []domain.MessageRecord) error {
 	if len(records) == 0 {
@@ -68,15 +73,16 @@ func (s *FileSink) WriteMessages(ctx context.Context, records []domain.MessageRe
 	}
 	started := time.Now()
 
-	// 按输出路径分组，用 paths 切片保持原始插入顺序
-	groups := make(map[string][]domain.MessageRecord)
+	// 按输出路径分组，用 paths 切片保持原始插入顺序。
+	// groupIndices 记录每条 record 在原始 records 切片中的索引，用于回写 OutputLine。
+	groups := make(map[string][]int)
 	paths := make([]string, 0)
-	for _, record := range records {
+	for i, record := range records {
 		path := s.PathFor(record)
 		if _, ok := groups[path]; !ok {
 			paths = append(paths, path)
 		}
-		groups[path] = append(groups[path], record)
+		groups[path] = append(groups[path], i)
 	}
 
 	for _, path := range paths {
@@ -88,7 +94,7 @@ func (s *FileSink) WriteMessages(ctx context.Context, records []domain.MessageRe
 		}
 		lock := s.lockFor(path)
 		lock.mu.Lock()
-		err := s.writeFile(path, groups[path])
+		err := s.writeFile(path, lock, records, groups[path])
 		lock.mu.Unlock()
 		s.releaseLock(path, lock)
 		// 每次写完后触发一次清理检查（受 cleanupInterval 限频）
@@ -118,13 +124,14 @@ func (s *FileSink) OutputRoot() string {
 }
 
 // lockFor 返回指定路径对应的 pathLock，若不存在则创建，并将引用计数加一。
+// 新建的 pathLock lineCount 和 byteOffset 初始为 -1，表示未初始化。
 func (s *FileSink) lockFor(path string) *pathLock {
 	now := s.now()
 	s.locksMu.Lock()
 	defer s.locksMu.Unlock()
 	lock := s.locks[path]
 	if lock == nil {
-		lock = &pathLock{lastUsed: now}
+		lock = &pathLock{lastUsed: now, lineCount: -1, byteOffset: -1}
 		s.locks[path] = lock
 	}
 	lock.users++
@@ -166,42 +173,75 @@ func (s *FileSink) cleanupIdleLocks() {
 	}
 }
 
-// writeFile 将 records 追加写入指定路径的 JSONL 文件，文件不存在时自动创建。
+// writeFile 将指定索引的 records 追加写入 JSONL 文件，文件不存在时自动创建。
 // 使用 bufio.Writer 减少系统调用次数，每条记录占一行。
+// 写入前初始化行数和字节大小缓存（若需要），写入后更新 records 的 OutputLine/OutputOffset 字段。
 // Flush 和 Close 的错误均会被捕获并返回，确保写入失败时调用方能感知。
-func (s *FileSink) writeFile(path string, records []domain.MessageRecord) error {
+func (s *FileSink) writeFile(path string, lock *pathLock, records []domain.MessageRecord, indices []int) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
+	}
+	// 首次使用时初始化行数和字节偏移缓存
+	if lock.lineCount < 0 || lock.byteOffset < 0 {
+		lock.lineCount = countLines(path)
+		lock.byteOffset = fileSize(path)
 	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
 	writer := bufio.NewWriter(file)
-	for _, record := range records {
-		line, err := json.Marshal(record)
+	for _, idx := range indices {
+		line, err := json.Marshal(records[idx])
 		if err != nil {
-			// 写入已失败，丢弃 Close 的次要错误，以原始错误返回
 			_ = file.Close()
 			return err
 		}
 		if _, err := writer.Write(line); err != nil {
-			// 写入已失败，丢弃 Close 的次要错误，以原始错误返回
 			_ = file.Close()
 			return err
 		}
 		if err := writer.WriteByte('\n'); err != nil {
-			// 写入已失败，丢弃 Close 的次要错误，以原始错误返回
 			_ = file.Close()
 			return err
 		}
+		// 更新字节偏移缓存：JSON 内容 + 换行符
+		lock.byteOffset += int64(len(line)) + 1
+		// 填充行号（从 1 开始），并推进缓存计数
+		lock.lineCount++
+		records[idx].OutputLine = lock.lineCount
+		// 填充写入后的文件末尾偏移（下次增量读取的起始位置）
+		records[idx].OutputOffset = lock.byteOffset
 	}
 	if err := writer.Flush(); err != nil {
-		// 写入已失败，丢弃 Close 的次要错误，以原始错误返回
 		_ = file.Close()
 		return err
 	}
 	return file.Close()
+}
+
+// countLines 统计文件当前行数。文件不存在或无法打开时返回 0。
+func countLines(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	count := 0
+	for scanner.Scan() {
+		count++
+	}
+	return count
+}
+
+// fileSize 返回文件当前字节大小。文件不存在或无法 stat 时返回 0。
+func fileSize(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return info.Size()
 }
 
 // PathFor 根据消息记录生成输出文件路径，格式为：

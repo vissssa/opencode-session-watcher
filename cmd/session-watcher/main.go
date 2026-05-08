@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +25,9 @@ import (
 )
 
 func main() {
+	// 自动加载 .env 文件中的环境变量（文件不存在时静默跳过）
+	loadEnvFile(".env")
+
 	// 解析命令行参数，校验失败时以退出码 2 退出（与 flag 包约定一致）
 	cfg, err := config.Parse(os.Args[1:])
 	if err != nil {
@@ -50,7 +55,7 @@ func main() {
 		"message_limit", cfg.MessageLimit,
 		"max_message_fetch", cfg.MaxMessageFetch,
 		"session_workers", cfg.SessionWorkers,
-		"db", cfg.DBPath,
+		"pg_dsn", maskDSN(cfg.PGDSN),
 		"output_dir", cfg.OutputDir,
 		"once", cfg.Once,
 		"timeout", cfg.Timeout.String(),
@@ -130,20 +135,33 @@ func main() {
 	logger.Info("session watcher exited")
 }
 
-// runWatcher 初始化并运行 watcher 核心逻辑（SQLite 存储、JSONL Sink、HTTP Source）。
+// runWatcher 初始化并运行 watcher 核心逻辑（PostgreSQL 存储、JSONL Sink、HTTP Source）。
 // 单次模式（-once）完成后返回，同步失败时返回非 nil error；
 // 持续轮询模式在 ctx 取消后返回 nil。
 // HA 模式下由 lease Leader 回调调用；单实例模式下由 main 直接调用。
 func runWatcher(ctx context.Context, cfg config.Config, reporter *status.Reporter, logger *slog.Logger) error {
-	// 打开 SQLite 状态存储，失败时无法保证增量去重，直接返回
-	stateStore, err := store.Open(ctx, cfg.DBPath)
-	if err != nil {
-		logger.Error("open sqlite store failed", "error", err)
-		return err
+	// 连接 PostgreSQL 状态存储：
+	// -once 模式使用临时 schema（与正式数据隔离，完成后自动清理），适合调试/CI
+	// 持续模式使用正式表，保留同步状态用于增量去重
+	var stateStore *store.Store
+	var err error
+	if cfg.Once {
+		stateStore, err = store.OpenTemp(ctx, cfg.PGDSN)
+		if err != nil {
+			logger.Error("open temp postgres store failed", "error", err)
+			return err
+		}
+		logger.Info("using temporary schema for once mode (auto-cleanup on exit)")
+	} else {
+		stateStore, err = store.Open(ctx, cfg.PGDSN)
+		if err != nil {
+			logger.Error("open postgres store failed", "error", err)
+			return err
+		}
 	}
 	defer func() {
 		if err := stateStore.Close(); err != nil {
-			logger.Warn("close sqlite store failed", "error", err)
+			logger.Warn("close postgres store failed", "error", err)
 		}
 	}()
 
@@ -228,4 +246,83 @@ func setupLogOutput(path string) (io.Writer, func(), error) {
 // timeAfter 是对 time.After 的可替换封装，便于测试时注入 fake 时钟。
 var timeAfter = func(d time.Duration) <-chan time.Time {
 	return time.After(d)
+}
+
+// maskDSN 隐藏 DSN 中的密码部分，用于日志输出。
+// 支持 keyword/value 格式（password='xxx'）和 URL 格式（user:pass@host）。
+func maskDSN(dsn string) string {
+	// keyword/value 格式：password='xxx' 或 password=xxx
+	if idx := strings.Index(dsn, "password="); idx >= 0 {
+		end := idx + len("password=")
+		// 跳过可能的引号
+		if end < len(dsn) && dsn[end] == '\'' {
+			closeQuote := strings.Index(dsn[end+1:], "'")
+			if closeQuote >= 0 {
+				return dsn[:end] + "'***'" + dsn[end+1+closeQuote+1:]
+			}
+		}
+		// 无引号，找下一个空格
+		spaceIdx := strings.Index(dsn[end:], " ")
+		if spaceIdx >= 0 {
+			return dsn[:end] + "***" + dsn[end+spaceIdx:]
+		}
+		return dsn[:end] + "***"
+	}
+	// URL 格式：scheme://user:pass@host
+	if idx := strings.Index(dsn, "://"); idx >= 0 {
+		rest := dsn[idx+3:]
+		atIdx := strings.Index(rest, "@")
+		if atIdx >= 0 {
+			colonIdx := strings.Index(rest[:atIdx], ":")
+			if colonIdx >= 0 {
+				return dsn[:idx+3] + rest[:colonIdx+1] + "***" + "@" + rest[atIdx+1:]
+			}
+		}
+	}
+	return dsn
+}
+
+// loadEnvFile 读取指定的 .env 文件并将其中的键值对设置为环境变量。
+// 仅设置当前进程中尚未定义的变量（不覆盖已有环境变量）。
+// 文件不存在时静默跳过，不影响程序启动。
+// 支持格式：KEY=VALUE、KEY="VALUE"、KEY='VALUE'、export KEY=VALUE，忽略注释和空行。
+func loadEnvFile(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return // 文件不存在或无权限，静默跳过
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		// 跳过空行和注释
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// 去掉 export 前缀
+		line = strings.TrimPrefix(line, "export ")
+		line = strings.TrimSpace(line)
+
+		// 按第一个 = 分割
+		eqIdx := strings.Index(line, "=")
+		if eqIdx <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:eqIdx])
+		value := strings.TrimSpace(line[eqIdx+1:])
+
+		// 去掉值两端的引号
+		if len(value) >= 2 {
+			if (value[0] == '"' && value[len(value)-1] == '"') ||
+				(value[0] == '\'' && value[len(value)-1] == '\'') {
+				value = value[1 : len(value)-1]
+			}
+		}
+
+		// 不覆盖已有的环境变量
+		if _, exists := os.LookupEnv(key); !exists {
+			os.Setenv(key, value)
+		}
+	}
 }

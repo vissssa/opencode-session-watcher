@@ -166,9 +166,10 @@ func TestWriteFile_NormalWriteSucceeds(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(root, "test.jsonl")
-	record := domain.MessageRecord{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "s", MessageID: "m",
-		Session: []byte(`{"id":"s"}`), Message: []byte(`{"info":{"id":"m"}}`)}
-	if err := sink.writeFile(path, []domain.MessageRecord{record}); err != nil {
+	records := []domain.MessageRecord{{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "s", MessageID: "m",
+		Session: []byte(`{"id":"s"}`), Message: []byte(`{"info":{"id":"m"}}`)}}
+	lock := &pathLock{lineCount: -1}
+	if err := sink.writeFile(path, lock, records, []int{0}); err != nil {
 		t.Fatalf("unexpected error on normal write: %v", err)
 	}
 }
@@ -188,19 +189,16 @@ func TestWriteFile_ErrorPathsPropagated(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(conflictFile, "subdir", "test.jsonl")
-	record := domain.MessageRecord{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "s", MessageID: "m",
-		Session: []byte(`{"id":"s"}`), Message: []byte(`{"info":{"id":"m"}}`)}
-	err = sink.writeFile(path, []domain.MessageRecord{record})
+	records := []domain.MessageRecord{{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "s", MessageID: "m",
+		Session: []byte(`{"id":"s"}`), Message: []byte(`{"info":{"id":"m"}}`)}}
+	lock := &pathLock{lineCount: -1}
+	err = sink.writeFile(path, lock, records, []int{0})
 	if err == nil {
 		t.Fatal("expected error when MkdirAll fails (parent is a regular file), got nil")
 	}
 }
 
 // TestWriteFile_WriteErrorReturned 验证写入过程中发生 I/O 错误时，writeFile 正确返回该错误。
-// 通过创建一个目标文件然后将其设为只读，再调用 writeFile 触发 OpenFile 权限错误，
-// 验证 writeFile 的错误传播路径有效（调用方不会收到 nil）。
-// 注：在标准文件系统上精确模拟 writer.Write 失败（不用 mock）较困难，
-// 这里通过 OpenFile 失败来验证整体错误传播机制可工作。
 func TestWriteFile_WriteErrorReturned(t *testing.T) {
 	if os.Getuid() == 0 {
 		t.Skip("skipping permission test when running as root")
@@ -215,10 +213,92 @@ func TestWriteFile_WriteErrorReturned(t *testing.T) {
 	if err := os.WriteFile(path, []byte{}, 0o444); err != nil {
 		t.Fatal(err)
 	}
-	record := domain.MessageRecord{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "s", MessageID: "m",
-		Session: []byte(`{"id":"s"}`), Message: []byte(`{"info":{"id":"m"}}`)}
-	err = sink.writeFile(path, []domain.MessageRecord{record})
+	records := []domain.MessageRecord{{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "s", MessageID: "m",
+		Session: []byte(`{"id":"s"}`), Message: []byte(`{"info":{"id":"m"}}`)}}
+	lock := &pathLock{lineCount: -1}
+	err = sink.writeFile(path, lock, records, []int{0})
 	if err == nil {
 		t.Fatal("expected error when opening read-only file for writing, got nil")
+	}
+}
+
+// TestFileSinkTracksOutputLine 验证 WriteMessages 正确填充 OutputLine 字段。
+func TestFileSinkTracksOutputLine(t *testing.T) {
+	root := t.TempDir()
+	sink, err := NewFileSink(root, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	// 第一批写入 3 条记录
+	records1 := []domain.MessageRecord{
+		{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "ses_line", MessageID: "m1", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m1"}`)},
+		{SyncedAt: 2, UserID: "u", AgentID: "a", SessionID: "ses_line", MessageID: "m2", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m2"}`)},
+		{SyncedAt: 3, UserID: "u", AgentID: "a", SessionID: "ses_line", MessageID: "m3", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m3"}`)},
+	}
+	if err := sink.WriteMessages(context.Background(), records1); err != nil {
+		t.Fatal(err)
+	}
+	// 验证行号从 1 开始递增
+	if records1[0].OutputLine != 1 {
+		t.Fatalf("records1[0].OutputLine = %d, want 1", records1[0].OutputLine)
+	}
+	if records1[1].OutputLine != 2 {
+		t.Fatalf("records1[1].OutputLine = %d, want 2", records1[1].OutputLine)
+	}
+	if records1[2].OutputLine != 3 {
+		t.Fatalf("records1[2].OutputLine = %d, want 3", records1[2].OutputLine)
+	}
+
+	// 第二批再写入 2 条记录，行号应续接
+	records2 := []domain.MessageRecord{
+		{SyncedAt: 4, UserID: "u", AgentID: "a", SessionID: "ses_line", MessageID: "m4", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m4"}`)},
+		{SyncedAt: 5, UserID: "u", AgentID: "a", SessionID: "ses_line", MessageID: "m5", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m5"}`)},
+	}
+	if err := sink.WriteMessages(context.Background(), records2); err != nil {
+		t.Fatal(err)
+	}
+	if records2[0].OutputLine != 4 {
+		t.Fatalf("records2[0].OutputLine = %d, want 4", records2[0].OutputLine)
+	}
+	if records2[1].OutputLine != 5 {
+		t.Fatalf("records2[1].OutputLine = %d, want 5", records2[1].OutputLine)
+	}
+}
+
+// TestFileSinkOutputLineAfterRestart 验证 pathLock 被回收后重新初始化时，
+// 通过 countLines 恢复行号缓存，后续写入的 OutputLine 仍然正确续接。
+func TestFileSinkOutputLineAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	sink, err := NewFileSink(root, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	// 先写入 2 条
+	records := []domain.MessageRecord{
+		{SyncedAt: 1, UserID: "u", AgentID: "a", SessionID: "ses_restart", MessageID: "m1", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m1"}`)},
+		{SyncedAt: 2, UserID: "u", AgentID: "a", SessionID: "ses_restart", MessageID: "m2", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m2"}`)},
+	}
+	if err := sink.WriteMessages(context.Background(), records); err != nil {
+		t.Fatal(err)
+	}
+
+	// 手动清除 lock 缓存，模拟 lock 被回收或进程重启
+	sink.locksMu.Lock()
+	sink.locks = make(map[string]*pathLock)
+	sink.locksMu.Unlock()
+
+	// 再写入 1 条，应该通过 countLines 恢复，行号续接为 3
+	records2 := []domain.MessageRecord{
+		{SyncedAt: 3, UserID: "u", AgentID: "a", SessionID: "ses_restart", MessageID: "m3", Session: []byte(`{"id":"s"}`), Message: []byte(`{"id":"m3"}`)},
+	}
+	if err := sink.WriteMessages(context.Background(), records2); err != nil {
+		t.Fatal(err)
+	}
+	if records2[0].OutputLine != 3 {
+		t.Fatalf("records2[0].OutputLine = %d, want 3", records2[0].OutputLine)
 	}
 }

@@ -1,6 +1,6 @@
 # session_watcher
 
-周期性从 [open-code](http://localhost:57811) 服务同步 AI 对话会话消息，以增量去重方式追加输出到本地 JSONL 文件，并用 SQLite 维护同步状态。
+周期性从 [open-code](http://localhost:57811) 服务同步 AI 对话会话消息，以增量去重方式追加输出到本地 JSONL 文件，并用 PostgreSQL 维护同步状态。
 
 ## 功能概述
 
@@ -22,16 +22,28 @@ make build
 
 ### 运行
 
+推荐使用 `.env` 文件配置（程序启动时自动加载，不覆盖已有环境变量）：
+
+```env
+# .env
+PG_DSN=host=localhost port=5432 user=app password=secret dbname=memory sslmode=disable
+BASE_URL=http://localhost:57811
+OUTPUT_DIR=./data/messages
+LOG_LEVEL=info
+```
+
+```bash
+./session_watcher
+```
+
+也可通过 CLI flag 或环境变量直接指定（优先级：CLI flag > 环境变量 > `.env` 文件）：
+
 ```bash
 ./session_watcher \
   -base-url http://localhost:57811 \
   -interval 10s \
-  -message-limit 100 \
-  -max-message-fetch 1000 \
-  -session-workers 8 \
-  -db ./data/state.db \
-  -output-dir ./data/messages \
-  -log-level info
+  -pg-dsn "host=localhost port=5432 user=app password=secret dbname=memory sslmode=disable" \
+  -output-dir ./data/messages
 ```
 
 ### 单次同步（调试用）
@@ -40,22 +52,56 @@ make build
 ./session_watcher -once
 ```
 
-## 命令行参数
+> `-once` 模式使用独立的临时 PostgreSQL schema，与正式数据完全隔离，运行结束后自动清理。适合调试和 CI 场景，不会污染线上状态。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `-base-url` | `http://localhost:57811` | open-code 服务基础地址 |
-| `-interval` | `10s` | 轮询间隔，支持 Go duration 格式 |
-| `-message-limit` | `100` | 每次 limit 扩展的步长 |
-| `-max-message-fetch` | `1000` | 单 Session 每轮最多拉取消息数 |
-| `-session-workers` | `8` | 最大并发 Session Worker 数 |
-| `-db` | `./data/state.db` | SQLite 状态数据库路径 |
-| `-output-dir` | `./data/messages` | JSONL 输出根目录 |
-| `-once` | `false` | 执行单轮同步后退出 |
-| `-timeout` | `10s` | HTTP 请求超时 |
-| `-log-level` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
-| `-log-file` | `./data/session-watcher.log` | 日志文件路径，空字符串禁用文件日志 |
-| `-health-addr` | `127.0.0.1:0` | Health 服务监听地址，空字符串禁用 |
+## 配置
+
+程序启动时按以下优先级读取配置：**CLI flag > 环境变量 > `.env` 文件 > 默认值**
+
+`.env` 文件支持格式：`KEY=VALUE`、`KEY="VALUE"`、`KEY='VALUE'`、`export KEY=VALUE`，忽略注释和空行。
+
+### 命令行参数与环境变量
+
+| 参数 | 环境变量 | 默认值 | 说明 |
+|------|----------|--------|------|
+| `-base-url` | `BASE_URL` | `http://localhost:57811` | open-code 服务基础地址 |
+| `-interval` | `INTERVAL` | `10s` | 轮询间隔，支持 Go duration 格式 |
+| `-message-limit` | `MESSAGE_LIMIT` | `100` | 每次 limit 扩展的步长 |
+| `-max-message-fetch` | `MAX_MESSAGE_FETCH` | `1000` | 单 Session 每轮最多拉取消息数 |
+| `-session-workers` | `SESSION_WORKERS` | `8` | 最大并发 Session Worker 数 |
+| `-pg-dsn` | `PG_DSN` | *(必填)* | PostgreSQL 连接字符串 |
+| | `PG_HOST`/`PG_PORT`/`PG_USER`/`PG_PASSWORD`/`PG_DB`/`PG_SSLMODE` | | 分字段拼接 DSN（`PG_DSN` 优先） |
+| `-output-dir` | `OUTPUT_DIR` | `./data/messages` | JSONL 输出根目录 |
+| `-once` | | `false` | 执行单轮同步后退出（使用临时 schema） |
+| `-timeout` | `TIMEOUT` | `10s` | HTTP 请求超时 |
+| `-log-level` | `LOG_LEVEL` | `info` | 日志级别：`debug` / `info` / `warn` / `error` |
+| `-log-file` | `LOG_FILE` | `./data/session-watcher.log` | 日志文件路径，空字符串禁用文件日志 |
+| `-health-addr` | `HEALTH_ADDR` | `127.0.0.1:0` | Health 服务监听地址，空字符串禁用 |
+| `-lease-path` | `LEASE_PATH` | *(空=禁用)* | Leader lease 文件路径（启用 HA 模式） |
+| `-lease-id` | `LEASE_ID` | *自动生成* | 实例唯一标识（默认 hostname:pid） |
+| `-lease-timeout` | `LEASE_TIMEOUT` | `30s` | Leader 超时时长 |
+| `-lease-renew-interval` | `LEASE_RENEW_INTERVAL` | `10s` | Leader 续约间隔 |
+| `-lease-poll-interval` | `LEASE_POLL_INTERVAL` | `5s` | Standby 轮询间隔 |
+
+### .env 示例
+
+```env
+# PostgreSQL 连接
+PG_DSN=host=10.57.148.238 port=8432 user=repmgr password='L#i_T^e^!@2025q' dbname=memory sslmode=disable
+
+# 或分字段方式（PG_DSN 优先）
+# PG_HOST=10.57.148.238
+# PG_PORT=8432
+# PG_USER=repmgr
+# PG_PASSWORD=L#i_T^e^!@2025q
+# PG_DB=memory
+
+# 服务配置
+BASE_URL=http://localhost:57811
+INTERVAL=10s
+OUTPUT_DIR=./data/messages
+LOG_LEVEL=info
+```
 
 ## 输出格式
 
@@ -96,7 +142,7 @@ internal/
   domain/               核心类型与接口（Source / Sink / PathResolver）
   source/opencode/      open-code HTTP Source 实现
   sink/jsonl/           JSONL FileSink 实现
-  store/                SQLite 状态存储
+  store/                PostgreSQL 状态存储
   watcher/              轮询调度与增量同步编排
   health/               HTTP health/status 服务
   status/               运行状态快照（线程安全）
@@ -130,7 +176,8 @@ type Sink interface {
 ### 单元测试
 
 ```bash
-go test -race -timeout 30s ./...
+PG_TEST_DSN="postgres://user:pass@host:5432/dbname?sslmode=disable" \
+  go test -race -timeout 120s ./...
 ```
 
 ### 端到端一致性验证
@@ -198,5 +245,82 @@ GOOS=linux GOARCH=arm64 make build
 
 | 包 | 版本 | 用途 |
 |----|------|------|
-| `modernc.org/sqlite` | v1.50.0 | Pure Go SQLite 驱动（免 CGO） |
+| `github.com/jackc/pgx/v5` | v5.7.4 | PostgreSQL 驱动 + 连接池 |
 | `gopkg.in/natefinch/lumberjack.v2` | v2.2.1 | 日志文件轮转 |
+
+## 外部服务集成
+
+### 增量读取 JSONL 消息
+
+外部服务（如记忆服务）可通过 `sessions.memorized_offset` 和 `sessions.file_size` 字段实现高效增量消费：
+
+```go
+// 1. 从 PostgreSQL 获取目标 Session 的文件路径、文件大小和已消费偏移
+var outputPath string
+var fileSize, memorizedOffset int64
+db.QueryRow(`
+    SELECT m.output_path, s.file_size, s.memorized_offset
+    FROM sessions s
+    JOIN messages m ON m.session_id = s.id
+    WHERE s.id = $1
+    LIMIT 1`, sessionID).Scan(&outputPath, &fileSize, &memorizedOffset)
+
+// 2. 快速判断是否有新内容（无需打开文件）
+if fileSize <= memorizedOffset {
+    // 无新内容，跳过
+    return
+}
+
+// 3. 从上次消费位置开始读取新消息（O(1) 定位，无需扫描历史内容）
+f, _ := os.Open(outputPath)
+defer f.Close()
+f.Seek(memorizedOffset, io.SeekStart)
+
+scanner := bufio.NewScanner(f)
+for scanner.Scan() {
+    var record map[string]interface{}
+    json.Unmarshal(scanner.Bytes(), &record)
+    // 处理新消息...
+}
+
+// 4. 处理完成后更新消费偏移和时间戳
+newOffset, _ := f.Seek(0, io.SeekCurrent)
+db.Exec(`UPDATE sessions SET memorized_offset = $1, memorized_at = EXTRACT(EPOCH FROM NOW()) * 1000 WHERE id = $2`,
+    newOffset, sessionID)
+```
+
+> **说明：**
+> - `sessions.file_size` 由 session_watcher 在每批消息写入后自动更新，表示该 Session 的 JSONL 文件当前字节大小
+> - `sessions.memorized_offset` 由外部消费者维护，记录已消费到的字节位置
+> - 判断是否有新内容：`file_size > memorized_offset`（无需访问文件系统）
+
+### 更新消费状态
+
+外部服务处理完 Session 的消息后，更新消费偏移和时间戳：
+
+```sql
+-- 更新消费偏移和时间戳
+UPDATE sessions
+SET memorized_offset = $1, memorized_at = EXTRACT(EPOCH FROM NOW()) * 1000
+WHERE id = $2;
+
+-- 查询有未消费内容的 Session（file_size > memorized_offset 表示有新写入尚未处理）
+SELECT id, file_size, memorized_offset, synced_at, memorized_at
+FROM sessions
+WHERE file_size > memorized_offset
+ORDER BY synced_at;
+```
+
+> **判断逻辑：** `sessions.file_size > sessions.memorized_offset` 表示该 Session 有新写入的消息尚未被外部服务消费。外部服务读取并处理完 JSONL 内容后，将 `memorized_offset` 更新为实际读取到的字节位置即可。
+
+### 数据模型关系
+
+```
+sessions 表
+├── file_size          → JSONL 文件当前字节大小（session_watcher 维护）
+├── memorized_offset   → 外部服务已消费到的字节偏移（外部消费者维护）
+├── memorized_at       → 外部服务最后消费的时间戳
+├── synced_at          → 最后一次写入消息的时间戳
+└── 1:N → messages 表
+           └── output_line    → 该消息在 JSONL 文件中的行号
+```
